@@ -1,0 +1,14 @@
+# Ignore data (too big)
+data/
+
+# Ignore results and model weights
+outputs/
+
+# Ignore Python's temporary folders
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Ignore system files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,31 @@
+# configs/default.yaml
+
+# 1. Where your data lives
+paths:
+  raw_stream_dir: "data/stream"
+  events_dir: "data/events"
+  output_dir: "outputs"
+
+# 2. Audio processing settings (for the Spectrogram)
+stft:
+  n_fft: 1024
+  hop_length: 256
+  win_length: 1024
+  window: "hann"
+  power: 2.0
+
+# 3. Data generation settings
+injection:
+  n_per_class: 500
+  background_chunk_size: 16384  # size of background audio slices
+
+# 4. Neural Network Training settings
+training:
+  lr: 0.001          # How fast the model learns
+  epochs: 50         # How many times to see the whole dataset
+  batch_size: 32     # How many samples to process at once
+
+# 5. Cross-Validation settings
+cv:
+  k: 5               # 5-fold cross validation
+  seed: 42           # Keeps results consistent every time you run it
