@@ -1,237 +1,247 @@
 #!/usr/bin/env python
-"""Event-level analysis of saved cross-validation probabilities.
+"""Controlled experiments on crack-versus-noise discrimination.
 
-For one condition of ``scripts.discrimination_experiments`` and each model, it
-reads the per-frame validation probabilities of every training seed (``.npz``)
-and reports:
+Each condition changes one aspect of training relative to the baseline and is
+evaluated on the same dataset (config/default_new.yaml), the same five folds,
+and training seed 0:
 
-* per seed: frame-level and event-level scores (majority vote and mean
-  probability);
-* the seed ensemble: per-frame probabilities averaged over the seeds, scored
-  the same way;
-* the ROC curve of the event-level crack score, its area (AUC), and the
-  crack-recall operating points read off that curve. These are descriptive
-  points on the curve, not thresholds tuned for deployment.
+  baseline     15 epochs, final weights (as in rerun_full_library)
+  best_epoch   weights of the epoch with the lowest loss on an inner
+               validation set carved out of the training chunks only
+  augment      training-only gain / noise / frequency-mask augmentation
+  both         best_epoch + augment
 
-    python -m scripts.event_level_analysis --condition best_epoch --seeds 0 1 2
+Besides the frame-level metrics, every injected event with frames in a
+validation fold is given one event-level label, either by majority vote of its
+frames' non-background predictions or by its mean class probabilities
+("missed" if all of its frames were predicted background). Per-frame
+validation probabilities are saved next to each result (.npz) so that
+ensembles and ROC analyses can be computed afterwards.
+
+    python -m scripts.discrimination_experiments --condition baseline --threads 2
 """
 
 from __future__ import annotations
 
 import argparse
-import re
 import json
 import pathlib
+import random
+import time
 
 import numpy as np
+import torch
 import yaml
-from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 from scripts.constants import CLASS_BACKGROUND, CLASS_CRACK, CLASS_NOISE, PROJECT_ROOT
 from scripts.prepare_data import event_library_paths, prepare_dataset
-from scripts.discrimination_experiments import (
-    CONFIG_PATH, OUT_DIR, event_decisions, event_scores, frame_event_ids,
-)
+from scripts.cross_validation import stratified_kfold_cv
+from models import build_model
+from scripts.augmentation_experiment import EVENT_LEN, MODEL_CFGS, simulate_placements
 
-LABEL = {"lstm": "LSTM", "cnn_lstm": "CNN-LSTM", "transformer": "Transformer"}
-TARGET_RECALLS = (0.80, 0.85, 0.90)
-TOP_FRACTIONS = (0.10, 0.20, 0.30)
-
-
-def load_folds(path: pathlib.Path) -> list[dict]:
-    z = np.load(path)
-    n = len([k for k in z.files if k.endswith("_y_prob")])
-    return [{"val_chunk_idx": z[f"fold{i}_val_chunk_idx"], "y_prob": z[f"fold{i}_y_prob"]}
-            for i in range(n)]
+CONFIG_PATH = PROJECT_ROOT / "config" / "default_new.yaml"
+OUT_DIR = PROJECT_ROOT / "outputs" / "discrimination"
+CONDITIONS = {
+    "baseline": {"inner_val_frac": 0.0, "augment": False},
+    "best_epoch": {"inner_val_frac": 0.15, "augment": False},
+    "augment": {"inner_val_frac": 0.0, "augment": True},
+    "both": {"inner_val_frac": 0.15, "augment": True},
+}
 
 
-def frame_scores(folds: list[dict], labels: np.ndarray, chunk_size: int) -> dict:
-    cm = np.zeros((3, 3), dtype=int)
+def frame_event_ids(config: dict, labels: np.ndarray) -> tuple[np.ndarray, list]:
+    """Per frame, the injected event the frame's label comes from (-1 for
+    background frames), and the placement list ``(class, lib_idx, start)``.
+
+    A frame is labelled with the highest-priority class present in its analysis
+    window (see ``align_labels_to_frames``); it is attributed to the event of
+    that class with the most samples in the window, so the attribution follows
+    the same rule as the label.
+    """
+    ds, stft = config["dataset"], config["stft"]
+    paths = event_library_paths(config)
+    sizes = {c: len(p) for c, p in paths.items()}
+    placements = simulate_placements(ds["n_samples"], sizes, ds["n_per_class"], ds["seed"],
+                                     ds.get("replace", True))
+    event_cls = np.array([c for c, _i, _s in placements])
+    instance = np.full(ds["n_samples"], -1, dtype=np.int64)
+    for k, (_c, _i, start) in enumerate(placements):
+        instance[start:start + EVENT_LEN] = k
+    hop, win = stft["hop_length"], stft["win_length"]
+    ids = np.full(len(labels), -1, dtype=np.int64)
+    for f in np.nonzero(labels != CLASS_BACKGROUND)[0]:
+        s = max(0, f * hop - win // 2)
+        w = instance[s:s + win]
+        w = w[w >= 0]
+        w = w[event_cls[w] == labels[f]]
+        ids[f] = np.bincount(w).argmax()
+    return ids, placements
+
+
+def event_decisions(folds: list[dict], ids: np.ndarray, placements: list,
+                    chunk_size: int) -> list[dict]:
+    """One record per injected event with frames in a validation fold.
+
+    ``folds`` holds, per fold, ``val_chunk_idx`` and ``y_prob`` (frames x 3).
+    An event cut by a fold boundary is scored once, in the fold holding most of
+    its frames. For each event: its true class, whether it was detected (any
+    frame predicted non-background), the majority-vote class among its
+    non-background frame predictions, and ``crack_score``, the mean crack
+    probability over its frames divided by the mean crack-plus-noise probability.
+    """
+    per_fold = []
     for fd in folds:
         frames = (np.asarray(fd["val_chunk_idx"])[:, None] * chunk_size
                   + np.arange(chunk_size)).reshape(-1)
-        np.add.at(cm, (labels[frames], fd["y_prob"].argmax(axis=1)), 1)
-    ev = cm[1:, 1:]
-    tp, fn, fp = ev.sum(), cm[1:, 0].sum(), cm[0, 1:].sum()
-    p, r = tp / (tp + fp), tp / (tp + fn)
-    f1 = []
-    for c in range(3):
-        pc, rc = cm[c, c] / max(cm[:, c].sum(), 1), cm[c, c] / max(cm[c].sum(), 1)
-        f1.append(2 * pc * rc / (pc + rc) if pc + rc else 0.0)
-    return {"aggregated_cm": cm.tolist(), "pooled_f1": f1, "pooled_macro_f1": float(np.mean(f1)),
-            "detection_f1": float(2 * p * r / (p + r)),
-            "discrimination_accuracy": float(np.trace(ev) / ev.sum())}
+        per_fold.append(ids[frames])
+    home = {}
+    for f, ev in enumerate(per_fold):
+        for k, n in zip(*np.unique(ev[ev >= 0], return_counts=True)):
+            if n > home.get(k, (-1, 0))[1]:
+                home[k] = (f, n)
+    records = []
+    for f, (fd, ev) in enumerate(zip(folds, per_fold)):
+        prob = np.asarray(fd["y_prob"])
+        pred = prob.argmax(axis=1)
+        for k in np.unique(ev[ev >= 0]):
+            if home[k][0] != f:
+                continue
+            sel = ev == k
+            p = pred[sel]
+            nb = p[p != CLASS_BACKGROUND]
+            n_c, n_n = int((nb == CLASS_CRACK).sum()), int((nb == CLASS_NOISE).sum())
+            mc, mn = prob[sel, CLASS_CRACK].mean(), prob[sel, CLASS_NOISE].mean()
+            records.append({
+                "event": int(k), "true": int(placements[k][0]),
+                "detected": bool(len(nb)),
+                "vote": CLASS_CRACK if n_c > n_n else CLASS_NOISE if n_n > n_c else None,
+                "crack_score": float(mc / (mc + mn)),
+            })
+    return records
 
 
-def roc_points(records: list[dict], experiment_of: dict[int, str] | None = None) -> dict:
-    y = np.array([r["true"] == CLASS_CRACK for r in records], dtype=int)
-    score = np.array([r["crack_score"] for r in records])
-    fpr, tpr, thr = roc_curve(y, score)
-    points = {}
-    for target in TARGET_RECALLS:
-        i = int(np.argmax(tpr >= target))
-        points[f"crack_recall_{target:.2f}"] = {
-            "crack_recall": float(tpr[i]), "noise_flagged_as_crack": float(fpr[i]),
-            "threshold": float(thr[i]),
-        }
-    # The confident end of the ranking: among the events the model finds most
-    # crack-like, what fraction are cracks, and what share of all cracks is that?
-    order = np.argsort(-score)
-    top = {}
-    for frac in TOP_FRACTIONS:
-        n = max(1, int(round(frac * len(score))))
-        sel = y[order[:n]]
-        entry = {"n_events": n, "crack_precision": float(sel.mean()),
-                 "share_of_all_cracks": float(sel.sum() / y.sum())}
-        if experiment_of is not None:
-            entry["from_2024"] = int(sum(experiment_of[records[i]["event"]].startswith("2024")
-                                         for i in order[:n]))
-        top[f"top_{int(frac * 100)}pct"] = entry
-    return {"auc": float(roc_auc_score(y, score)), "fpr": fpr.tolist(), "tpr": tpr.tolist(),
-            "average_precision": float(average_precision_score(y, score)),
-            "crack_prevalence": float(y.mean()),
-            "operating_points": points, "most_crack_like": top}
-
-
-def by_experiment(records: list[dict], experiment_of: dict[int, str]) -> dict:
-    """Crack-versus-noise separation among the events of one experiment only,
-    where knowing the experiment gives no information about the class.
-    Balanced accuracy (mean of crack and noise recall, probability rule) and
-    AUC; 0.5 is chance for both."""
-    out = {}
-    for exp in sorted(set(experiment_of.values())):
-        rs = [r for r in records if experiment_of[r["event"]] == exp]
-        y = np.array([r["true"] == CLASS_CRACK for r in rs], dtype=int)
-        pred = np.array([r["detected"] and r["crack_score"] > 0.5 for r in rs], dtype=int)
-        n_c, n_n = int(y.sum()), int(len(y) - y.sum())
-        entry = {"n_crack": n_c, "n_noise": n_n}
-        if n_c and n_n:
-            rec_c = float((pred[y == 1] == 1).mean())
-            rec_n = float((pred[y == 0] == 0).mean())
-            score = np.array([r["crack_score"] for r in rs])
-            entry.update({"crack_recall": rec_c, "noise_recall": rec_n,
-                          "balanced_accuracy": (rec_c + rec_n) / 2,
-                          "auc": float(roc_auc_score(y, score)),
-                          "crack_prevalence": float(y.mean())})
-            order = np.argsort(-score)
-            for frac in TOP_FRACTIONS:
-                n = max(1, int(round(frac * len(score))))
-                entry[f"top_{int(frac * 100)}pct_crack_precision"] = float(y[order[:n]].mean())
-        out[exp] = entry
-    return out
+def event_scores(records: list[dict], rule: str) -> dict:
+    """Event-level confusion (rows true crack/noise; columns predicted
+    crack / noise / missed) and scores, for ``rule`` = "vote" (majority of
+    frame predictions; a tie counts as wrong) or "prob" (crack if crack_score
+    > 0.5). Undetected events are "missed" under both rules."""
+    cm = np.zeros((2, 3), dtype=int)
+    for r in records:
+        row = 0 if r["true"] == CLASS_CRACK else 1
+        if not r["detected"]:
+            col = 2
+        elif rule == "vote":
+            col = {CLASS_CRACK: 0, CLASS_NOISE: 1}.get(r["vote"], 1 - row)  # tie -> wrong
+        else:
+            col = 0 if r["crack_score"] > 0.5 else 1
+        cm[row, col] += 1
+    detected = cm[:, :2]
+    correct = cm[0, 0] + cm[1, 1]
+    prec_c = cm[0, 0] / max(detected[:, 0].sum(), 1)
+    rec_c = cm[0, 0] / max(cm[0].sum(), 1)
+    prec_n = cm[1, 1] / max(detected[:, 1].sum(), 1)
+    rec_n = cm[1, 1] / max(cm[1].sum(), 1)
+    f1 = lambda p, r: 2 * p * r / (p + r) if p + r else 0.0
+    return {
+        "confusion_rows_true_crack_noise_cols_pred_crack_noise_missed": cm.tolist(),
+        "n_events": int(cm.sum()),
+        "accuracy": float(correct / cm.sum()),
+        "discrimination_accuracy": float(correct / max(detected.sum(), 1)),
+        "crack_f1": float(f1(prec_c, rec_c)),
+        "noise_f1": float(f1(prec_n, rec_n)),
+        "macro_f1": float((f1(prec_c, rec_c) + f1(prec_n, rec_n)) / 2),
+        "detected_fraction": float(detected.sum() / cm.sum()),
+    }
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--condition", required=True)
-    ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
+    ap.add_argument("--condition", required=True, choices=list(CONDITIONS))
     ap.add_argument("--models", nargs="+", default=["lstm", "cnn_lstm", "transformer"])
-    ap.add_argument("--figure", default=None, help="write the ensemble ROC figure here")
-    ap.add_argument("--in-dir", default=None, help="results folder (default outputs/discrimination)")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--threads", type=int, default=2)
+    ap.add_argument("--epochs", type=int, default=None, help="override (smoke tests only)")
+    ap.add_argument("--out-dir", default=None)
     ap.add_argument("--config", default=str(CONFIG_PATH))
+    ap.add_argument("--lstm-hidden", type=int, default=None, help="LSTM units per direction (default 128)")
+    ap.add_argument("--lstm-layers", type=int, default=None, help="number of LSTM layers (default 2)")
+    ap.add_argument("--tag", default="", help="suffix for the output file names, e.g. _h32")
     args = ap.parse_args()
+    torch.set_num_threads(args.threads)
 
     config_path = pathlib.Path(args.config).resolve()
     config = yaml.safe_load(config_path.read_text())
     config["_config_dir"] = str(config_path.parent)
-    cs = config["dataset"]["chunk_size"]
-    _, labels = prepare_dataset(config)                    # from cache
+    ds, tr = config["dataset"], config["training"]
+    spectrogram, labels = prepare_dataset(config)          # from cache
     ids, placements = frame_event_ids(config, labels)
-    lib_paths = event_library_paths(config)
-    experiment_of = {k: ("2022 (2 V)" if "/2V/" in lib_paths[c][i] else "2024 (1.3 V)")
-                     for k, (c, i, _s) in enumerate(placements)}
-    specimen_of = {k: re.sub(r"^\d+_|_20\d{6}-.*$", "", pathlib.Path(lib_paths[c][i]).name)
-                   for k, (c, i, _s) in enumerate(placements)}
-    # only events with frames in the chunked part of the stream are scored
-    scored = set(np.unique(ids[: len(labels) // cs * cs])) - {-1}
-    shortcut = np.mean([(c == CLASS_CRACK) == (experiment_of[k] == "2024 (1.3 V)")
-                        for k, (c, _i, _s) in enumerate(placements) if k in scored])
+    train_cfg = {"num_epochs": args.epochs or tr["num_epochs"], "learning_rate": tr["learning_rate"],
+                 "batch_size": tr["batch_size"], "chunk_size": ds["chunk_size"]}
 
-    in_dir = pathlib.Path(args.in_dir) if args.in_dir else OUT_DIR
-    summary = {"condition": args.condition, "seeds": args.seeds, "models": {},
-               "shortcut_baseline_experiment_to_class": float(shortcut)}
-    print(f"shortcut baseline (class guessed from experiment alone): {shortcut:.3f}")
+    out_dir = pathlib.Path(args.out_dir) if args.out_dir else OUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     for model in args.models:
-        runs = [load_folds(in_dir / f"{args.condition}_{model}_seed{s}.npz") for s in args.seeds]
-        # the fold split is fixed, so every seed must have identical validation chunks
-        for run in runs[1:]:
-            for a, b in zip(runs[0], run):
-                assert np.array_equal(a["val_chunk_idx"], b["val_chunk_idx"])
-        m = {"per_seed": {}}
-        for s, run in zip(args.seeds, runs):
-            rec = event_decisions(run, ids, placements, cs)
-            m["per_seed"][str(s)] = {"frame": frame_scores(run, labels, cs),
-                                     "event_vote": event_scores(rec, "vote"),
-                                     "event_prob": event_scores(rec, "prob"),
-                                     "event_auc": roc_points(rec)["auc"],
-                                     "by_experiment": by_experiment(rec, experiment_of)}
-        ens = [{"val_chunk_idx": fd["val_chunk_idx"],
-                "y_prob": np.mean([run[i]["y_prob"] for run in runs], axis=0)}
-               for i, fd in enumerate(runs[0])]
-        rec = event_decisions(ens, ids, placements, cs)
-        m["ensemble"] = {"frame": frame_scores(ens, labels, cs),
-                         "event_vote": event_scores(rec, "vote"),
-                         "event_prob": event_scores(rec, "prob"),
-                         "roc": roc_points(rec, experiment_of),
-                         "by_experiment": by_experiment(rec, experiment_of),
-                         "by_specimen": by_experiment(rec, specimen_of)}
-        summary["models"][model] = m
-
-        e, r = m["ensemble"], m["ensemble"]["roc"]
-        print(f"\n{LABEL[model]} ({args.condition}, seeds {args.seeds})")
-        for s in args.seeds:
-            ps = m["per_seed"][str(s)]
-            print(f"  seed {s}: frame disc {ps['frame']['discrimination_accuracy']:.3f} | "
-                  f"event vote {ps['event_vote']['discrimination_accuracy']:.3f} | "
-                  f"event prob {ps['event_prob']['discrimination_accuracy']:.3f} | "
-                  f"AUC {ps['event_auc']:.3f}")
-        print(f"  ensemble: frame disc {e['frame']['discrimination_accuracy']:.3f} | "
-              f"detection F1 {e['frame']['detection_f1']:.3f} | "
-              f"event prob {e['event_prob']['discrimination_accuracy']:.3f} "
-              f"(crack F1 {e['event_prob']['crack_f1']:.3f}, noise F1 {e['event_prob']['noise_f1']:.3f}) | "
-              f"AUC {r['auc']:.3f}")
-        for exp, v in e["by_experiment"].items():
-            if "balanced_accuracy" in v:
-                print(f"    within {exp}: {v['n_crack']} crack / {v['n_noise']} noise -> balanced acc "
-                      f"{v['balanced_accuracy']:.3f}, AUC {v['auc']:.3f} (chance 0.5); top-10/20/30% "
-                      f"crack precision {v['top_10pct_crack_precision']:.2f}/{v['top_20pct_crack_precision']:.2f}/"
-                      f"{v['top_30pct_crack_precision']:.2f} vs prevalence {v['crack_prevalence']:.2f}")
-        for sp, v in e["by_specimen"].items():
-            if "balanced_accuracy" in v and min(v["n_crack"], v["n_noise"]) >= 5:
-                print(f"    within specimen {sp}: {v['n_crack']} crack / {v['n_noise']} noise -> balanced acc "
-                      f"{v['balanced_accuracy']:.3f}, AUC {v['auc']:.3f}")
-        for name, t in r["most_crack_like"].items():
-            print(f"    {name} most crack-like events ({t['n_events']}, {t.get('from_2024', '?')} from 2024): "
-                  f"{t['crack_precision']:.2f} are cracks, covering {t['share_of_all_cracks']:.2f} of all cracks")
-        for name, op in r["operating_points"].items():
-            print(f"    {name}: crack recall {op['crack_recall']:.3f}, "
-                  f"noise flagged as crack {op['noise_flagged_as_crack']:.3f}")
-
-    out = in_dir / f"event_level_summary_{args.condition}.json"
-    out.write_text(json.dumps(summary, indent=2))
-    print(f"\nwrote {out}")
-
-    if args.figure:
-        with plt.rc_context({"font.size": 13}):
-            fig, ax = plt.subplots(figsize=(6.2, 5.6))
-            for model in args.models:
-                r = summary["models"][model]["ensemble"]["roc"]
-                ax.plot(r["fpr"], r["tpr"], lw=2, label=f"{LABEL[model]} (AUC {r['auc']:.2f})")
-            ax.plot([0, 1], [0, 1], "--", color="#999999", lw=1, label="Chance")
-            ax.set_xlabel("Noise events labelled crack (false-alarm rate)")
-            ax.set_ylabel("Crack events labelled crack (recall)")
-            ax.set_xlim(0, 1)
-            ax.set_ylim(0, 1.01)
-            ax.grid(alpha=0.3)
-            ax.legend(loc="lower right", frameon=False)
-            fig.tight_layout()
-            fig.savefig(args.figure, dpi=200, bbox_inches="tight")
-            plt.close(fig)
-        print(f"wrote {args.figure}")
+        print(f"\n##### {args.condition} | {model} | seed {args.seed}")
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        t0 = time.time()
+        cfg = dict(MODEL_CFGS[model])
+        if model == "lstm" and args.lstm_hidden:
+            cfg["hidden_size"] = args.lstm_hidden
+        if model == "lstm" and args.lstm_layers:
+            cfg["num_layers"] = args.lstm_layers
+        n_params = sum(p.numel() for p in build_model(model, n_freq=spectrogram.shape[0], n_classes=3,
+                                                      **cfg).parameters() if p.requires_grad)
+        r = stratified_kfold_cv(model, cfg, (spectrogram, labels), k=5,
+                                seed=ds["seed"], train_cfg=train_cfg, save_checkpoints=False,
+                                **CONDITIONS[args.condition])
+        cm = r.aggregated_cm
+        ev = cm[1:, 1:]
+        tp, fn, fp = cm[1:, 1:].sum(), cm[1:, 0].sum(), cm[0, 1:].sum()
+        det_p, det_r = tp / (tp + fp), tp / (tp + fn)
+        out = {
+            "condition": args.condition, "model": model, "training_seed": args.seed,
+            "seconds": round(time.time() - t0, 1),
+            "macro_f1_mean": r.macro_f1_mean,
+            "macro_f1_per_fold": [float(fr.f1.mean()) for fr in r.folds],
+            "f1_mean": r.f1_mean.tolist(), "f1_std": r.f1_std.tolist(),
+            "precision_mean": r.precision_mean.tolist(), "recall_mean": r.recall_mean.tolist(),
+            "aggregated_cm": cm.tolist(),
+            "frame_detection_f1": float(2 * det_p * det_r / (det_p + det_r)),
+            "frame_discrimination_accuracy": float(np.trace(ev) / ev.sum()),
+            "best_epochs": [fr.best_epoch for fr in r.folds],
+            "model_config": cfg, "n_parameters": int(n_params),
+            "final_train_loss_per_fold": [float(fr.train_losses[-1]) for fr in r.folds],
+            "final_val_loss_per_fold": [float(fr.val_losses[-1]) for fr in r.folds],
+            "train_losses_per_fold": [list(map(float, fr.train_losses)) for fr in r.folds],
+            "val_losses_per_fold": [list(map(float, fr.val_losses)) for fr in r.folds],
+            # same per-model fields as outputs/rerun_full_library/results.json
+            "macro_f1_std": float(np.std([fr.f1.mean() for fr in r.folds], ddof=1)),
+            "accuracy_per_fold": [float(fr.accuracy) for fr in r.folds],
+            "precision_std": np.std([fr.precision for fr in r.folds], axis=0, ddof=1).tolist(),
+            "recall_std": np.std([fr.recall for fr in r.folds], axis=0, ddof=1).tolist(),
+            "per_fold_cm": [np.asarray(fr.cm, dtype=int).tolist() for fr in r.folds],
+            "n_train_per_fold": [int(fr.n_train) for fr in r.folds],
+            "n_val_per_fold": [int(fr.n_val) for fr in r.folds],
+        }
+        out["f1_std"] = np.std([fr.f1 for fr in r.folds], axis=0, ddof=1).tolist()
+        folds = [{"val_chunk_idx": fr.val_chunk_idx, "y_prob": fr.y_prob} for fr in r.folds]
+        records = event_decisions(folds, ids, placements, ds["chunk_size"])
+        out["event_level"] = event_scores(records, "vote")
+        out["event_level_prob"] = event_scores(records, "prob")
+        path = out_dir / f"{args.condition}_{model}{args.tag}_seed{args.seed}.json"
+        path.write_text(json.dumps(out, indent=2))
+        np.savez_compressed(
+            path.with_suffix(".npz"),
+            **{f"fold{i}_val_chunk_idx": fd["val_chunk_idx"] for i, fd in enumerate(folds)},
+            **{f"fold{i}_y_prob": fd["y_prob"] for i, fd in enumerate(folds)},
+        )
+        e = out["event_level_prob"]
+        print(f"saved {path.name}: macro {out['macro_f1_mean']:.4f} | frame disc "
+              f"{out['frame_discrimination_accuracy']:.3f} | event disc (vote) "
+              f"{out['event_level']['discrimination_accuracy']:.3f} (prob) "
+              f"{e['discrimination_accuracy']:.3f} | ({out['seconds']:.0f}s)")
 
 
 if __name__ == "__main__":
